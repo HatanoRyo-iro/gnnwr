@@ -1239,3 +1239,380 @@ def _init_gtnnwr_stpnn_distance_pred(
     pred_t_point_matrix = np.concatenate(
             (pred_t_point_matrix, np.transpose(refer_t_point_pred_matrix, (1, 0, 2))), axis=2)
     return (pred_s_point_matrix, pred_t_point_matrix)
+
+
+class STNKDE_Dataset(Dataset):
+    r"""
+    STNKDE_Dataset is a dataset class for Spatio-Temporal Neural Network Kernel Density Estimation.
+    It loads data from parquet files and prepares spatio-temporal distance features for training.
+    
+    Parameters
+    ----------
+    data_path : str
+        Path to the parquet file containing all arixels with accident counts
+    spatial_column : list
+        Column names for spatial coordinates (e.g., ['x', 'y'] or ['lon', 'lat'])
+    temporal_column : str
+        Column name for temporal information (e.g., 'timestamp' or 'hour')
+    accident_column : str
+        Column name for accident counts (e.g., 'accident_count' or 'n_accidents')
+    id_column : str
+        Column name for unique arixel identifier (e.g., 'arixel_id' or 'segment_id')
+    min_accidents : int
+        Minimum number of accidents to include an arixel in training (default: 1)
+    spatial_fun : callable
+        Function to calculate spatial distance (default: BasicDistance)
+    temporal_fun : callable
+        Function to calculate temporal distance (default: ManhattanDistance)
+    batch_size : int
+        Batch size for DataLoader (default: 32)
+    shuffle : bool
+        Whether to shuffle the data (default: True)
+    context_columns : list, optional
+        Column names appended as contextual features for each arixel.
+    add_temporal_encoding : bool
+        Whether to append sin/cos encoding of the temporal column.
+    temporal_period : float
+        Period (in temporal units) used for the sin/cos encoding.
+    distance_scaler : {"none","minmax","standard"}
+        Strategy used to normalize spatial/temporal distances.
+    distance_scaler_params : dict, optional
+        Pre-computed scaler statistics (useful for validation/test datasets).
+    max_neighbors : int, optional
+        Maximum number of reference arixels retained per sample (top-k by distance).
+    """
+    
+    def __init__(self, 
+                 data_path=None,
+                 data=None,
+                 spatial_column=None,
+                 temporal_column=None,
+                 accident_column=None,
+                 id_column=None,
+                 min_accidents=1,
+                 spatial_fun=BasicDistance,
+                 temporal_fun=ManhattanDistance,
+                 batch_size=32,
+                 shuffle=True,
+                 context_columns=None,
+                 add_temporal_encoding=False,
+                 temporal_period=24.0,
+                 distance_scaler="none",
+                 distance_scaler_params=None,
+                 max_neighbors=None):
+        
+        if data is None:
+            if data_path is None:
+                raise ValueError("Either data_path or data must be provided")
+            self.dataframe = pd.read_parquet(data_path)
+        else:
+            self.dataframe = data.copy()
+        
+        self.spatial_column = spatial_column
+        self.temporal_column = temporal_column
+        self.accident_column = accident_column
+        self.id_column = id_column
+        self.min_accidents = min_accidents
+        self.spatial_fun = spatial_fun
+        self.temporal_fun = temporal_fun
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.context_columns = context_columns or []
+        self.add_temporal_encoding = bool(add_temporal_encoding) and temporal_column is not None
+        self.temporal_period = temporal_period
+        self.distance_scaler = (distance_scaler or "none").lower()
+        self.distance_scale_params = distance_scaler_params
+        self.max_neighbors = max_neighbors
+        self.active_reference = None
+        self.neighbor_indices = None
+        self.context_dim = 0
+        
+        # Filter arixels with accidents (for training)
+        if accident_column is not None:
+            self.accident_arixels = self.dataframe[
+                self.dataframe[accident_column] >= min_accidents
+            ].copy()
+        else:
+            # If no accident column, use all arixels
+            self.accident_arixels = self.dataframe.copy()
+        
+        # Store reference data (accident arixels) for distance calculation
+        self.reference_spatial = self.accident_arixels[spatial_column].values.astype(np.float32)
+        self.reference_temporal = self.accident_arixels[[temporal_column]].values.astype(np.float32)
+        self.reference_ids = self.accident_arixels[id_column].values
+        
+        # Calculate distances for each accident arixel to all other accident arixels
+        self._calculate_distances()
+        self._scale_distances()
+        self._apply_neighbor_limit()
+        
+    def _calculate_distances(self):
+        """Calculate spatio-temporal distances between accident arixels."""
+        n_accidents = len(self.accident_arixels)
+        
+        # Calculate spatial distances
+        spatial_dist = self.spatial_fun(self.reference_spatial, self.reference_spatial)
+        # Calculate temporal distances
+        temporal_dist = self.temporal_fun(self.reference_temporal, self.reference_temporal)
+        
+        # Combine into (n_samples, n_reference, 2) shape
+        # Each sample has distances to all reference points
+        self.distances = np.concatenate([
+            spatial_dist[:, :, np.newaxis],
+            temporal_dist[:, :, np.newaxis]
+        ], axis=2).astype(np.float32)
+        
+        # Store arixel IDs and accident counts
+        self.arixel_ids = self.accident_arixels[self.id_column].values
+        if self.accident_column is not None:
+            self.accident_counts = self.accident_arixels[self.accident_column].values.astype(np.float32)
+        else:
+            self.accident_counts = np.ones(len(self.accident_arixels), dtype=np.float32)
+        
+        # Build context features (road profile, encoded time, etc.)
+        self._build_context_features()
+    
+    def _scale_distances(self):
+        """Normalize spatial/temporal distances if requested."""
+        if self.distance_scaler == "none":
+            if self.distance_scale_params is None:
+                self.distance_scale_params = {}
+            return
+        flat = self.distances.reshape(-1, self.distances.shape[-1])
+        if not self.distance_scale_params:
+            if self.distance_scaler == "minmax":
+                mins = flat.min(axis=0)
+                maxs = flat.max(axis=0)
+                self.distance_scale_params = {"min": mins, "max": maxs}
+            elif self.distance_scaler == "standard":
+                mean = flat.mean(axis=0)
+                std = flat.std(axis=0)
+                std[std == 0] = 1.0
+                self.distance_scale_params = {"mean": mean, "std": std}
+            else:
+                raise ValueError(f"Unsupported distance_scaler '{self.distance_scaler}'")
+        flat = self._apply_scaler(flat, self.distance_scale_params)
+        self.distances = flat.reshape(self.distances.shape)
+    
+    def _apply_neighbor_limit(self):
+        """Keep only the closest neighbors to reduce memory usage."""
+        if not self.max_neighbors:
+            self.active_reference = self.distances.shape[1]
+            return
+        k = min(int(self.max_neighbors), self.distances.shape[1])
+        if k <= 0:
+            raise ValueError("max_neighbors must be positive when provided.")
+        if k == self.distances.shape[1]:
+            self.active_reference = self.distances.shape[1]
+            return
+        metrics = np.linalg.norm(self.distances, axis=2)
+        idx = np.argpartition(metrics, kth=k - 1, axis=1)[:, :k]
+        row = np.arange(metrics.shape[0])[:, None]
+        selected_metrics = metrics[row, idx]
+        order = np.argsort(selected_metrics, axis=1)
+        idx = idx[row, order]
+        self.distances = self.distances[row, idx]
+        self.neighbor_indices = idx
+        self.active_reference = k
+    
+    @staticmethod
+    def _apply_scaler(flat_distances, params):
+        if "min" in params and "max" in params:
+            denom = (params["max"] - params["min"])
+            denom[denom == 0] = 1.0
+            return (flat_distances - params["min"]) / denom
+        if "mean" in params and "std" in params:
+            std = params["std"].copy()
+            std[std == 0] = 1.0
+            return (flat_distances - params["mean"]) / std
+        return flat_distances
+    
+    def _build_context_features(self):
+        """Assemble optional contextual features for reference arixels and all arixels."""
+        # Build reference arixel context features (for all reference points)
+        ref_context_parts = []
+        if self.context_columns:
+            ref_context_parts.append(
+                self.accident_arixels[self.context_columns].values.astype(np.float32)
+            )
+        if self.add_temporal_encoding and self.temporal_column is not None:
+            temporal_values = self.accident_arixels[self.temporal_column].values.astype(np.float32)
+            sin_component = np.sin(2 * np.pi * temporal_values / self.temporal_period)
+            cos_component = np.cos(2 * np.pi * temporal_values / self.temporal_period)
+            ref_context_parts.append(np.stack([sin_component, cos_component], axis=1).astype(np.float32))
+        if ref_context_parts:
+            self.reference_context_features = np.concatenate(ref_context_parts, axis=1).astype(np.float32)
+            self.context_dim = self.reference_context_features.shape[1]
+        else:
+            self.reference_context_features = None
+            self.context_dim = 0
+        
+        # Also build context features for accident arixels (for training samples)
+        # This is the same as reference_context_features since accident_arixels are the reference points
+        self.context_features = self.reference_context_features
+    
+    def __len__(self):
+        """Return the number of accident arixels."""
+        return len(self.accident_arixels)
+    
+    def __getitem__(self, index):
+        """
+        Return distance features for a given arixel.
+        
+        Returns
+        -------
+        distances : torch.Tensor
+            Spatio-temporal distances from this arixel to all reference arixels
+            Shape: (n_reference, 2) where 2 is [spatial_dist, temporal_dist]
+        arixel_id : torch.Tensor
+            ID of the arixel
+        accident_count : torch.Tensor
+            Accident count for this arixel
+        target_context : torch.Tensor
+            Contextual features of the target arixel (shape: ``(context_dim,)``). 
+            If ``context_dim == 0`` it returns an empty tensor.
+        reference_context : torch.Tensor
+            Contextual features of all reference arixels (shape: ``(n_reference, context_dim)``).
+            If neighbor pruning is applied, only selected reference points are included.
+            If ``context_dim == 0`` it returns an empty tensor with shape ``(n_reference, 0)``.
+        """
+        if self.context_dim > 0:
+            target_context = torch.tensor(self.context_features[index], dtype=torch.float32)
+            # Get reference context features (all reference points or selected ones if neighbor pruning)
+            if self.neighbor_indices is not None:
+                # If neighbor pruning was applied, select only the neighbors
+                ref_context = self.reference_context_features[self.neighbor_indices[index]]
+            else:
+                ref_context = self.reference_context_features
+            reference_context = torch.tensor(ref_context, dtype=torch.float32)
+        else:
+            target_context = torch.zeros(0, dtype=torch.float32)
+            n_ref = self.distances.shape[1]
+            reference_context = torch.zeros((n_ref, 0), dtype=torch.float32)
+        return (
+            torch.tensor(self.distances[index], dtype=torch.float32),
+            torch.tensor(self.arixel_ids[index], dtype=torch.long),
+            torch.tensor(self.accident_counts[index], dtype=torch.float32),
+            target_context,
+            reference_context
+        )
+    
+    @property
+    def dataloader(self):
+        """Return DataLoader for this dataset."""
+        return DataLoader(
+            self,
+            batch_size=self.batch_size,
+            shuffle=self.shuffle,
+            num_workers=0
+        )
+    
+    def get_all_arixels_data(self):
+        """
+        Get data for all arixels (including those without accidents) for prediction.
+        
+        Returns
+        -------
+        all_arixels : pandas.DataFrame
+            DataFrame containing all arixels
+        all_distances : numpy.ndarray
+            Distances (after scaling/neighbor pruning) from all arixels to reference arixels
+            Shape: (n_all_arixels, k, 2)
+        all_context : numpy.ndarray or None
+            Contextual feature matrix matching ``all_arixels`` rows.
+        """
+        all_arixels = self.dataframe.copy()
+        all_spatial = all_arixels[self.spatial_column].values.astype(np.float32)
+        all_temporal = all_arixels[[self.temporal_column]].values.astype(np.float32)
+        
+        # Calculate distances from all arixels to accident arixels
+        spatial_dist = self.spatial_fun(all_spatial, self.reference_spatial)
+        temporal_dist = self.temporal_fun(all_temporal, self.reference_temporal)
+        
+        all_distances = np.concatenate([
+            spatial_dist[:, :, np.newaxis],
+            temporal_dist[:, :, np.newaxis]
+        ], axis=2).astype(np.float32)
+        
+        # Apply same scaling as training set
+        if self.distance_scaler != "none" and self.distance_scale_params:
+            flat = all_distances.reshape(-1, all_distances.shape[-1])
+            flat = self._apply_scaler(flat, self.distance_scale_params)
+            all_distances = flat.reshape(all_distances.shape)
+        
+        # Apply neighbor limitation consistently and get selected indices
+        all_distances, selected_indices = self._limit_neighbors_for_array(all_distances, return_indices=True)
+        
+        # Context features for every arixel (needed at prediction time)
+        context_parts = []
+        if self.context_columns:
+            context_parts.append(all_arixels[self.context_columns].values.astype(np.float32))
+        if self.add_temporal_encoding and self.temporal_column is not None:
+            temporal_values = all_arixels[self.temporal_column].values.astype(np.float32)
+            sin_component = np.sin(2 * np.pi * temporal_values / self.temporal_period)
+            cos_component = np.cos(2 * np.pi * temporal_values / self.temporal_period)
+            context_parts.append(np.stack([sin_component, cos_component], axis=1).astype(np.float32))
+        if context_parts:
+            all_context = np.concatenate(context_parts, axis=1).astype(np.float32)
+        else:
+            all_context = None
+        
+        # Reference context features aligned with distance matrix
+        # Each sample has different selected neighbors, so we need to select reference context accordingly
+        if self.context_dim > 0:
+            if selected_indices is not None:
+                # Select reference context for each sample's selected neighbors
+                # selected_indices: (n_samples, k) where k is the number of neighbors
+                n_samples = selected_indices.shape[0]
+                k = selected_indices.shape[1]
+                ref_context = np.zeros((n_samples, k, self.context_dim), dtype=np.float32)
+                for i in range(n_samples):
+                    ref_context[i] = self.reference_context_features[selected_indices[i]]
+            else:
+                # No neighbor pruning: all reference points are used
+                ref_context = self.reference_context_features
+        else:
+            ref_context = None
+        
+        return all_arixels, all_distances, all_context, ref_context
+
+    def _limit_neighbors_for_array(self, distances, return_indices=False):
+        """
+        Apply neighbor pruning to an arbitrary distance tensor.
+        
+        Parameters
+        ----------
+        distances : numpy.ndarray
+            Distance tensor (n_samples, n_reference, 2)
+        return_indices : bool
+            If True, also return the selected neighbor indices
+        
+        Returns
+        -------
+        distances : numpy.ndarray
+            Pruned distance tensor (n_samples, k, 2)
+        indices : numpy.ndarray, optional
+            Selected neighbor indices (n_samples, k). Only returned if return_indices=True
+        """
+        if not self.max_neighbors:
+            if return_indices:
+                n_samples, n_ref = distances.shape[:2]
+                indices = np.arange(n_ref)[None, :].repeat(n_samples, axis=0)
+                return distances, indices
+            return distances
+        k = min(int(self.max_neighbors), distances.shape[1])
+        if k == distances.shape[1]:
+            if return_indices:
+                n_samples, n_ref = distances.shape[:2]
+                indices = np.arange(n_ref)[None, :].repeat(n_samples, axis=0)
+                return distances, indices
+            return distances
+        metrics = np.linalg.norm(distances, axis=2)
+        idx = np.argpartition(metrics, kth=k - 1, axis=1)[:, :k]
+        row = np.arange(metrics.shape[0])[:, None]
+        selected_metrics = metrics[row, idx]
+        order = np.argsort(selected_metrics, axis=1)
+        idx = idx[row, order]
+        if return_indices:
+            return distances[row, idx], idx
+        return distances[row, idx]
